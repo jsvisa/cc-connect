@@ -64,3 +64,25 @@ func (p *Platform) handleCloseIdleAgentSessions(w http.ResponseWriter, r *http.R
 		"skipped_session_keys": skippedKeys,
 	})
 }
+
+// BindQueuedMessagePurger implements core.QueuedMessagePurgerBinder. The
+// engine is bound so queued-but-not-started messages can be withdrawn
+// through the cancel API.
+func (p *Platform) BindQueuedMessagePurger(qp core.QueuedMessagePurger) {
+	p.queuePurgerMu.Lock()
+	defer p.queuePurgerMu.Unlock()
+	p.queuePurger = qp
+}
+
+// purgeQueuedMessage withdraws a message still waiting in a busy session's
+// queue. Returns false when the engine has not been bound (unit tests) or
+// no matching queued message exists.
+func (p *Platform) purgeQueuedMessage(messageID, user, channel string) bool {
+	p.queuePurgerMu.RLock()
+	qp := p.queuePurger
+	p.queuePurgerMu.RUnlock()
+	if qp == nil {
+		return false
+	}
+	return qp.PurgeQueuedMessage(messageID, user, channel)
+}

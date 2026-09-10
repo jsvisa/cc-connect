@@ -60,8 +60,10 @@ type Platform struct {
 	sessions *core.SessionManager
 	pending  *pendingStore
 
-	idleCloser   core.IdleAgentSessionCloser
-	idleCloserMu sync.RWMutex
+	idleCloser    core.IdleAgentSessionCloser
+	idleCloserMu  sync.RWMutex
+	queuePurger   core.QueuedMessagePurger
+	queuePurgerMu sync.RWMutex
 
 	downloadGCMu       sync.Mutex
 	downloadGCLast     map[string]time.Time // channelKey -> last lazy GC time
@@ -331,5 +333,6 @@ var _ core.HookContextProvider = (*Platform)(nil)
 var _ core.ProcessingEndNotifier = (*Platform)(nil)
 var _ core.SessionManagerBinder = (*Platform)(nil)
 var _ core.IdleAgentSessionCloserBinder = (*Platform)(nil)
+var _ core.QueuedMessagePurgerBinder = (*Platform)(nil)
 var _ core.WorkspaceSessionStorePolicy = (*Platform)(nil)
 var _ core.ChannelNameResolver = (*Platform)(nil)

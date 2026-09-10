@@ -492,23 +492,24 @@ type workspaceInitFlow struct {
 // The message is NOT sent to agent stdin at queue time; the event loop
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
-	messageID         string
-	platform          Platform
-	replyCtx          any
-	content           string
-	images            []ImageAttachment
-	files             []FileAttachment
-	fromVoice         bool
-	userID            string
-	userName          string    // sender's display name for sender injection
-	userEmail         string    // sender email for sender injection, when the platform explicitly provides it
-	msgPlatform       string    // platform name for sender injection
-	msgSessionKey     string    // session key for extracting chat ID
-	channelKey        string    // platform-provided channel identifier (preferred over sessionKey extraction)
-	userMessageTimeMs int64     // Feishu create_time ms (optional); see Message.UserMessageTimeMs
-	receivedAt        time.Time // engine ingress time; see Message.ReceivedAt
-	agentContext      AgentContext
-	skipPromptMeta    bool // see Message.SkipPromptMeta
+	messageID           string
+	platform            Platform
+	replyCtx            any
+	content             string
+	images              []ImageAttachment
+	files               []FileAttachment
+	fromVoice           bool
+	userID              string
+	userName            string    // sender's display name for sender injection
+	userEmail           string    // sender email for sender injection, when the platform explicitly provides it
+	msgPlatform         string    // platform name for sender injection
+	msgSessionKey       string    // session key for extracting chat ID
+	channelKey          string    // platform-provided channel identifier (preferred over sessionKey extraction)
+	userMessageTimeMs   int64     // Feishu create_time ms (optional); see Message.UserMessageTimeMs
+	receivedAt          time.Time // engine ingress time; see Message.ReceivedAt
+	queueDepthAtEnqueue int       // queue depth when this message was enqueued
+	agentContext        AgentContext
+	skipPromptMeta      bool // see Message.SkipPromptMeta
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -2316,6 +2317,9 @@ func (e *Engine) Start() error {
 		if binder, ok := p.(IdleAgentSessionCloserBinder); ok {
 			binder.BindIdleAgentSessionCloser(e)
 		}
+		if binder, ok := p.(QueuedMessagePurgerBinder); ok {
+			binder.BindQueuedMessagePurger(e)
+		}
 		_, isAsync := p.(AsyncRecoverablePlatform)
 		if async, ok := p.(AsyncRecoverablePlatform); ok {
 			async.SetLifecycleHandler(e)
@@ -3204,23 +3208,24 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		return true // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
-		messageID:         msg.MessageID,
-		platform:          p,
-		replyCtx:          msg.ReplyCtx,
-		content:           msg.Content,
-		images:            msg.Images,
-		files:             msg.Files,
-		fromVoice:         msg.FromVoice,
-		userID:            msg.UserID,
-		userName:          msg.UserName,
-		userEmail:         msg.UserEmail,
-		msgPlatform:       msg.Platform,
-		msgSessionKey:     msg.SessionKey,
-		channelKey:        msg.ChannelKey,
-		userMessageTimeMs: msg.UserMessageTimeMs,
-		receivedAt:        msg.ReceivedAt,
-		agentContext:      msg.AgentContext.Clone(),
-		skipPromptMeta:    msg.SkipPromptMeta,
+		messageID:           msg.MessageID,
+		platform:            p,
+		replyCtx:            msg.ReplyCtx,
+		content:             msg.Content,
+		images:              msg.Images,
+		files:               msg.Files,
+		fromVoice:           msg.FromVoice,
+		userID:              msg.UserID,
+		userName:            msg.UserName,
+		userEmail:           msg.UserEmail,
+		msgPlatform:         msg.Platform,
+		msgSessionKey:       msg.SessionKey,
+		channelKey:          msg.ChannelKey,
+		userMessageTimeMs:   msg.UserMessageTimeMs,
+		receivedAt:          msg.ReceivedAt,
+		queueDepthAtEnqueue: len(state.pendingMessages) + 1,
+		agentContext:        msg.AgentContext.Clone(),
+		skipPromptMeta:      msg.SkipPromptMeta,
 	})
 	queueDepth := len(state.pendingMessages)
 
@@ -4422,6 +4427,33 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 // CloseIdleAgentSessions closes live agent processes that are idle (not mid-turn,
 // permission-waiting, or queued). Preserves Session.AgentSessionID for resume.
 // Implements IdleAgentSessionCloser.
+// PurgeQueuedMessage removes a still-queued message (never started) matching
+// message id, user, and channel. Queued messages carry the run id they were
+// accepted with, so platforms can withdraw them by id while they wait.
+func (e *Engine) PurgeQueuedMessage(messageID, user, channel string) bool {
+	e.interactiveMu.Lock()
+	states := make([]*interactiveState, 0, len(e.interactiveStates))
+	for _, st := range e.interactiveStates {
+		if st != nil {
+			states = append(states, st)
+		}
+	}
+	e.interactiveMu.Unlock()
+
+	for _, st := range states {
+		st.mu.Lock()
+		for i, q := range st.pendingMessages {
+			if q.messageID == messageID && (user == "" || q.userID == user) && (channel == "" || q.channelKey == channel) {
+				st.pendingMessages = append(st.pendingMessages[:i], st.pendingMessages[i+1:]...)
+				st.mu.Unlock()
+				return true
+			}
+		}
+		st.mu.Unlock()
+	}
+	return false
+}
+
 func (e *Engine) CloseIdleAgentSessions() CloseIdleAgentSessionsResult {
 	var result CloseIdleAgentSessionsResult
 
@@ -4984,8 +5016,9 @@ var agentErrorHandlers = []agentErrorHandler{
 // (measured inside the event loop) includes session spawn/resume on cold
 // starts, since Send only runs after the agent session exists.
 type turnStages struct {
-	receivedAt  time.Time     // engine ingress; zero disables queue_wait_ms
-	hookElapsed time.Duration // message.processing sync-hook time (queued turns measure their own)
+	receivedAt          time.Time     // engine ingress; zero disables queue_wait_ms
+	hookElapsed         time.Duration // message.processing sync-hook time (queued turns measure their own)
+	queueDepthAtEnqueue int           // queue depth when this message was accepted into the queue
 }
 
 // queueStageWait returns ingress→turnStart; zero when ingress time is unknown
@@ -5086,6 +5119,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	firstEventLogged := false
 	firstEventElapsed := time.Duration(0)
 	stageQueueWait := queueStageWait(stages.receivedAt, turnStart)
+	stageQueueDepth := stages.queueDepthAtEnqueue
 	stageHookElapsed := stages.hookElapsed
 	// Per-tool wall-clock timing: openTools pairs EventToolUse with the next
 	// EventToolResult (FIFO — CLI tools run sequentially; the events carry no
@@ -6007,6 +6041,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				"response_len", len(fullResponse),
 				"turn_duration", turnDuration,
 				"queue_wait_ms", stageQueueWait.Milliseconds(),
+				"queue_depth", stageQueueDepth,
 				"hook_ms", stageHookElapsed.Milliseconds(),
 				"first_event_ms", firstEventElapsed.Milliseconds(),
 				"tool_time_ms", toolWall.Milliseconds(),
@@ -6322,6 +6357,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				firstEventElapsed = 0
 				waitStart = time.Now()
 				stageQueueWait = queueStageWait(queued.receivedAt, turnStart)
+				stageQueueDepth = queued.queueDepthAtEnqueue
 				stageHookElapsed = 0
 				openTools = nil
 				toolTimeTotal = 0
@@ -6430,6 +6466,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				"msg_id", msgID,
 				"turn_duration", time.Since(turnStart),
 				"queue_wait_ms", stageQueueWait.Milliseconds(),
+				"queue_depth", stageQueueDepth,
 				"hook_ms", stageHookElapsed.Milliseconds(),
 				"first_event_ms", firstEventElapsed.Milliseconds(),
 				"tool_time_ms", toolWall.Milliseconds(),
@@ -6689,7 +6726,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, turnStages{receivedAt: queued.receivedAt})
+		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, turnStages{receivedAt: queued.receivedAt, queueDepthAtEnqueue: queued.queueDepthAtEnqueue})
 	}
 }
 

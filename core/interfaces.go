@@ -129,6 +129,21 @@ type IdleAgentSessionCloserBinder interface {
 	BindIdleAgentSessionCloser(c IdleAgentSessionCloser)
 }
 
+// QueuedMessagePurger lets platforms withdraw a message that is still
+// waiting in a busy session's queue (accepted with message_queued but not
+// started). Implemented by Engine.
+type QueuedMessagePurger interface {
+	// PurgeQueuedMessage removes the queued message with the given message
+	// id (the run id it was accepted with) when it matches the submitting
+	// user and channel. Returns true when a queued message was removed.
+	PurgeQueuedMessage(messageID, user, channel string) bool
+}
+
+// QueuedMessagePurgerBinder is optional; Engine.Start binds it.
+type QueuedMessagePurgerBinder interface {
+	BindQueuedMessagePurger(p QueuedMessagePurger)
+}
+
 // WorkspaceSessionStorePolicy lets platforms opt out of per-workspace session
 // stores while still using per-workspace agents/work_dir. This is useful for
 // APIs whose public conversation IDs are already globally unique.

@@ -38,7 +38,18 @@ func (p *Platform) handleCancelRun(w http.ResponseWriter, r *http.Request, runID
 		return
 	}
 	run := p.pending.get(runID)
-	if run == nil || run.user != user {
+	if run == nil {
+		// The run already ended when the message was accepted as queued
+		// (message_queued closes the SSE). If it is still waiting in the
+		// busy session's queue, withdraw it there.
+		if p.purgeQueuedMessage(runID, user, channel) {
+			writeOK(w, http.StatusOK, map[string]string{"result": "success", "cancelled": "queued"})
+			return
+		}
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if run.user != user {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
